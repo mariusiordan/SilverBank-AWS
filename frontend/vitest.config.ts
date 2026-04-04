@@ -12,11 +12,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      '@/backend/src': path.resolve(__dirname, './src'),
-      '@/lib': path.resolve(__dirname, './src'),
+      '@': path.resolve(__dirname, './'),
     },
-  },
-  ssr: {
-    noExternal: ['jsonwebtoken', 'bcryptjs'],
   },
 });

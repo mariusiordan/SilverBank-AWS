@@ -1,0 +1,18 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies
+COPY package*.json ./
+RUN npm ci
+
+# Copy all source files
+COPY . .
+
+# Test environment variables
+ENV JWT_SECRET=test-secret-key
+ENV JWT_REFRESH_SECRET=test-refresh-secret-key
+ENV NODE_ENV=test
+ENV DATABASE_URL=postgresql://test:test@localhost:5432/test
+
+CMD ["npm", "run", "test"]
