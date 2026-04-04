@@ -1,0 +1,253 @@
+# .github/workflows/pipeline-2-staging.yml
+#
+# Pipeline 2 — Build and Push to ECR
+# Trigger: push to main
+#
+# Flow:
+#   lint
+#     ├── test-jwt      ┐
+#     ├── test-auth     ├── build-images → push-images
+#     └── test-account  ┘
+
+name: Staging
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # ============================================================
+  # JOB 1 — Lint
+  # ============================================================
+  lint:
+    name: ESLint
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          echo "Installing frontend dependencies..."
+          npm ci
+          echo "✅ OK - Dependencies installed"
+
+      - name: Run ESLint
+        run: |
+          echo "Running ESLint static analysis..."
+          npm run lint
+          echo "✅ OK - Lint passed"
+
+  # ============================================================
+  # JOB 2 — JWT Tests
+  # ============================================================
+  test-jwt:
+    name: JWT Tests
+    runs-on: ubuntu-24.04
+    needs: lint
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run JWT tests
+        run: |
+          echo "Running JWT unit tests..."
+          npx vitest run __tests__/jwt.test.ts
+          echo "✅ OK - JWT tests passed"
+
+  # ============================================================
+  # JOB 3 — Auth Tests
+  # ============================================================
+  test-auth:
+    name: Auth Tests
+    runs-on: ubuntu-24.04
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build test container
+        run: |
+          echo "Building backend test container..."
+          docker build -t silverbank-test -f backend/Dockerfile.test ./backend
+          echo "✅ OK - Test container built"
+
+      - name: Run auth tests
+        run: |
+          echo "Running auth tests inside Docker..."
+          docker run --rm silverbank-test \
+            npx vitest run __tests__/login.test.ts __tests__/register.test.ts
+          echo "✅ OK - Auth tests passed"
+
+  # ============================================================
+  # JOB 4 — Account Tests
+  # ============================================================
+  test-account:
+    name: Account Tests
+    runs-on: ubuntu-24.04
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build test container
+        run: |
+          echo "Building backend test container..."
+          docker build -t silverbank-test -f backend/Dockerfile.test ./backend
+          echo "✅ OK - Test container built"
+
+      - name: Run account tests
+        run: |
+          echo "Running account tests inside Docker..."
+          docker run --rm silverbank-test \
+            npx vitest run __tests__/account.test.ts
+          echo "✅ OK - Account tests passed"
+
+  # ============================================================
+  # JOB 5 — Build Docker Images
+  # Builds frontend and backend images
+  # Frontend receives ALB DNS as build arg — baked into Next.js bundle
+  # Only runs after all tests pass
+  # ============================================================
+  build-images:
+    name: Build Docker Images
+    runs-on: ubuntu-24.04
+    needs: [test-jwt, test-auth, test-account]
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate image tag
+        id: tag
+        run: |
+          # Version convention:
+          #   MAJOR (v1 → v2) — breaking changes, major architecture changes
+          #   MINOR (v1.0 → v1.1) — new features, improvements
+          # Always update VERSION manually when releasing a new version
+          VERSION="v1.0"
+          SHA=$(git rev-parse --short HEAD)
+          TAG="${VERSION}-sha-${SHA}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Image tag: ${TAG}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build frontend image
+        run: |
+          echo "Building frontend image..."
+          echo "NEXT_PUBLIC_API_URL will be set to ALB DNS name"
+        
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            NEXT_PUBLIC_API_URL=http://${{ secrets.ALB_DNS_NAME }}
+          tags: |
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:${{ steps.tag.outputs.tag }}
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:latest
+
+      - name: Build backend image
+        run: |
+          echo "Building backend image..."
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: |
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend:${{ steps.tag.outputs.tag }}
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend:latest
+
+      - name: Build summary
+        run: |
+          echo "✅ OK - Both images built successfully"
+          echo "Frontend: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:${{ steps.tag.outputs.tag }}"
+          echo "Backend:  ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend:${{ steps.tag.outputs.tag }}"
+
+  # ============================================================
+  # JOB 6 — Push Images to ECR
+  # Logs into AWS ECR and pushes both images
+  # Tags: versioned tag + latest
+  # ============================================================
+  push-images:
+    name: Push Images to ECR
+    runs-on: ubuntu-24.04
+    needs: build-images
+    outputs:
+      image_tag: ${{ needs.build-images.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Push frontend image
+        run: |
+          echo "Pushing frontend image to ECR..."
+          echo "Tag: ${{ needs.build-images.outputs.image_tag }}"
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=http://${{ secrets.ALB_DNS_NAME }}
+          tags: |
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:${{ needs.build-images.outputs.image_tag }}
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:latest
+
+      - name: Push backend image
+        run: |
+          echo "Pushing backend image to ECR..."
+          echo "Tag: ${{ needs.build-images.outputs.image_tag }}"
+
+      - uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend:${{ needs.build-images.outputs.image_tag }}
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend:latest
+
+      - name: Push summary
+        run: |
+          echo "✅ OK - Both images pushed to ECR"
+          echo "Frontend: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:${{ needs.build-images.outputs.image_tag }}"
+          echo "Backend:  ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend:${{ needs.build-images.outputs.image_tag }}"
+          echo "Both images also tagged as ':latest'"
