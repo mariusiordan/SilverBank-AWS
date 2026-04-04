@@ -52,6 +52,7 @@ jobs:
   # ============================================================
   # JOB 2 — JWT Tests
   # Unit tests for JWT token generation and verification
+  # Runs locally — no Docker needed, no database needed
   # Runs in parallel with Auth and Account tests after lint
   # ============================================================
   test-jwt:
