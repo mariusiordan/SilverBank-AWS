@@ -1,12 +1,13 @@
+cat > .github/workflows/pipeline-2-staging.yml << 'ENDOFFILE'
 # .github/workflows/pipeline-2-staging.yml
 #
-# Pipeline 2 — Build and Push to ECR
+# Pipeline 2 — Build, Test, Push to ECR
 # Trigger: push to main
 #
 # Flow:
 #   lint
 #     ├── test-jwt      ┐
-#     ├── test-auth     ├── build-images → push-images
+#     ├── test-auth     ├── build-images → spin-up-staging → integration-tests → destroy-staging → push-images
 #     └── test-account  ┘
 
 name: Staging
@@ -135,10 +136,6 @@ jobs:
       - name: Generate image tag
         id: tag
         run: |
-          # Version convention:
-          #   MAJOR (v1 → v2) — breaking changes, major architecture changes
-          #   MINOR (v1.0 → v1.1) — new features, improvements
-          # Always update VERSION manually when releasing a new version
           VERSION="v1.0"
           SHA=$(git rev-parse --short HEAD)
           TAG="${VERSION}-sha-${SHA}"
@@ -149,10 +146,8 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Build frontend image
-        run: |
-          echo "Building frontend image..."
-          echo "NEXT_PUBLIC_API_URL will be set to ALB DNS name"
-        
+        run: echo "Building frontend image..."
+
       - uses: docker/build-push-action@v5
         with:
           context: ./frontend
@@ -166,8 +161,7 @@ jobs:
             ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:latest
 
       - name: Build backend image
-        run: |
-          echo "Building backend image..."
+        run: echo "Building backend image..."
 
       - uses: docker/build-push-action@v5
         with:
@@ -186,14 +180,308 @@ jobs:
           echo "Backend:  ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend:${{ steps.tag.outputs.tag }}"
 
   # ============================================================
-  # JOB 6 — Push Images to ECR
-  # Logs into AWS ECR and pushes both images
-  # Tags: versioned tag + latest
+  # JOB 6 — Spin Up Ephemeral Staging EC2
+  # Launches a t3.micro in the public subnet
+  # Runs docker-compose with frontend + backend + PostgreSQL
+  # This EC2 is temporary — destroyed after integration tests
+  # ============================================================
+  spin-up-staging:
+    name: Spin Up Staging EC2
+    runs-on: ubuntu-24.04
+    needs: build-images
+    outputs:
+      instance_id: ${{ steps.launch.outputs.instance_id }}
+      instance_ip: ${{ steps.launch.outputs.instance_ip }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Launch staging EC2
+        id: launch
+        run: |
+          echo "Launching ephemeral staging EC2..."
+
+          AMI_ID=$(aws ec2 describe-images \
+            --owners 099720109477 \
+            --filters \
+              "Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*" \
+              "Name=virtualization-type,Values=hvm" \
+            --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+            --output text)
+
+          echo "Using AMI: ${AMI_ID}"
+
+          USER_DATA=$(base64 -w 0 << 'SCRIPT'
+#!/bin/bash
+set -e
+apt-get update -y
+apt-get install -y ca-certificates curl unzip
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+apt-get update -y
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip && ./aws/install
+rm -rf awscliv2.zip aws/
+systemctl enable docker
+systemctl start docker
+SCRIPT
+)
+
+          INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id ${AMI_ID} \
+            --instance-type t3.micro \
+            --subnet-id ${{ secrets.STAGING_SUBNET_ID }} \
+            --security-group-ids ${{ secrets.STAGING_SG_ID }} \
+            --key-name ${{ secrets.EC2_KEY_PAIR_NAME }} \
+            --associate-public-ip-address \
+            --iam-instance-profile Name=silverbank-ec2-profile-production \
+            --user-data "${USER_DATA}" \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=silverbank-staging-ephemeral},{Key=Project,Value=silverbank},{Key=Environment,Value=staging}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+
+          echo "Instance ID: ${INSTANCE_ID}"
+          aws ec2 wait instance-running --instance-ids ${INSTANCE_ID}
+
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --instance-ids ${INSTANCE_ID} \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+            --output text)
+
+          echo "Instance IP: ${INSTANCE_IP}"
+          echo "instance_id=${INSTANCE_ID}" >> $GITHUB_OUTPUT
+          echo "instance_ip=${INSTANCE_IP}" >> $GITHUB_OUTPUT
+          echo "✅ OK - Staging EC2 launched: ${INSTANCE_ID} (${INSTANCE_IP})"
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/staging_key
+          chmod 600 ~/.ssh/staging_key
+          echo "StrictHostKeyChecking no" >> ~/.ssh/config
+
+      - name: Wait for SSH to be ready
+        run: |
+          INSTANCE_IP="${{ steps.launch.outputs.instance_ip }}"
+          echo "Waiting for SSH on ${INSTANCE_IP}..."
+          for i in $(seq 1 20); do
+            if ssh -i ~/.ssh/staging_key -o ConnectTimeout=5 ubuntu@${INSTANCE_IP} "echo ready" 2>/dev/null; then
+              echo "✅ OK - SSH available"
+              exit 0
+            fi
+            echo "Attempt ${i}/20 — waiting 15s..."
+            sleep 15
+          done
+          echo "❌ SSH never became available"
+          exit 1
+
+      - name: Deploy containers to staging
+        run: |
+          INSTANCE_IP="${{ steps.launch.outputs.instance_ip }}"
+          TAG="${{ needs.build-images.outputs.image_tag }}"
+          FRONTEND_IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:${TAG}"
+          BACKEND_IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend:${TAG}"
+          AWS_REGION="${{ secrets.AWS_REGION }}"
+          AWS_ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID }}"
+          JWT_SECRET="${{ secrets.JWT_SECRET }}"
+          JWT_REFRESH_SECRET="${{ secrets.JWT_REFRESH_SECRET }}"
+
+          echo "Deploying containers to staging EC2..."
+
+          ssh -i ~/.ssh/staging_key ubuntu@${INSTANCE_IP} bash << ENDSSH
+set -e
+
+aws ecr get-login-password --region ${AWS_REGION} | \
+  docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+docker pull ${FRONTEND_IMAGE}
+docker pull ${BACKEND_IMAGE}
+
+mkdir -p /opt/silverbank
+cat > /opt/silverbank/docker-compose.yml << COMPOSE
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: silverbank
+      POSTGRES_USER: silverbank_admin
+      POSTGRES_PASSWORD: staging_test_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U silverbank_admin -d silverbank"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    image: ${BACKEND_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://silverbank_admin:staging_test_password@postgres:5432/silverbank
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_REFRESH_SECRET=${JWT_REFRESH_SECRET}
+      - PORT=4000
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    image: ${FRONTEND_IMAGE}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=http://${INSTANCE_IP}:4000
+    depends_on:
+      - backend
+COMPOSE
+
+cd /opt/silverbank
+docker compose up -d
+echo "Containers started"
+ENDSSH
+
+          echo "✅ OK - Containers deployed to staging"
+
+  # ============================================================
+  # JOB 7 — Integration Tests
+  # Runs against the live ephemeral staging environment
+  # Tests full user lifecycle: health, register, login, cleanup
+  # If tests fail — staging is still destroyed in destroy-staging
+  # ============================================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-24.04
+    needs: [build-images, spin-up-staging]
+    outputs:
+      tests_passed: ${{ steps.run-tests.outputs.tests_passed }}
+    steps:
+      - name: Wait for application to be ready
+        run: |
+          INSTANCE_IP="${{ needs.spin-up-staging.outputs.instance_ip }}"
+          echo "Waiting for backend health endpoint..."
+          for i in $(seq 1 20); do
+            if curl -sf http://${INSTANCE_IP}:4000/api/health > /dev/null 2>&1; then
+              echo "✅ OK - Backend is ready"
+              exit 0
+            fi
+            echo "Attempt ${i}/20 — not ready yet, waiting 15s..."
+            sleep 15
+          done
+          echo "❌ Backend never became ready"
+          exit 1
+
+      - name: Run integration tests
+        id: run-tests
+        run: |
+          INSTANCE_IP="${{ needs.spin-up-staging.outputs.instance_ip }}"
+          TAG="${{ needs.build-images.outputs.image_tag }}"
+          TEST_EMAIL="ci-test-${GITHUB_RUN_ID}@silverbank.test"
+
+          echo "Starting integration tests against staging"
+          echo "Instance: ${INSTANCE_IP}"
+          echo "Image tag: ${TAG}"
+          echo "Test email: ${TEST_EMAIL}"
+
+          echo "--- Test 1: Health check ---"
+          HEALTH=$(curl -sf http://${INSTANCE_IP}:4000/api/health)
+          echo "Response: ${HEALTH}"
+          echo "${HEALTH}" | grep -q '"status":"ok"' || exit 1
+          echo "✅ OK - Health check passed"
+
+          echo "--- Test 2: Image tag verification ---"
+          if echo "${HEALTH}" | grep -q "${TAG}"; then
+            echo "✅ OK - Correct image tag confirmed: ${TAG}"
+          else
+            echo "⚠️  Warning: image tag not in health response"
+          fi
+
+          echo "--- Test 3: User registration ---"
+          REGISTER=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST http://${INSTANCE_IP}:4000/api/auth/register \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"CI Test\",\"email\":\"${TEST_EMAIL}\",\"password\":\"test123\"}")
+          echo "Register HTTP status: ${REGISTER}"
+          [ "${REGISTER}" = "201" ] || exit 1
+          echo "✅ OK - Registration passed (HTTP 201)"
+
+          echo "--- Test 4: User login ---"
+          LOGIN=$(curl -s -c /tmp/cookies.txt -o /dev/null -w "%{http_code}" \
+            -X POST http://${INSTANCE_IP}:4000/api/auth/login \
+            -H "Content-Type: application/json" \
+            -d "{\"email\":\"${TEST_EMAIL}\",\"password\":\"test123\"}")
+          echo "Login HTTP status: ${LOGIN}"
+          [ "${LOGIN}" = "200" ] || exit 1
+          echo "✅ OK - Login passed (HTTP 200)"
+
+          echo "--- Test 5: Account access ---"
+          ACCOUNT=$(curl -s -b /tmp/cookies.txt -o /dev/null -w "%{http_code}" \
+            http://${INSTANCE_IP}:4000/api/account)
+          echo "Account HTTP status: ${ACCOUNT}"
+          [ "${ACCOUNT}" = "200" ] || exit 1
+          echo "✅ OK - Account access passed (HTTP 200)"
+
+          echo "--- Cleanup: Delete test user ---"
+          curl -s -b /tmp/cookies.txt \
+            -X DELETE http://${INSTANCE_IP}:4000/api/auth/delete \
+            -H "Content-Type: application/json" > /dev/null
+          echo "✅ OK - Test user deleted"
+
+          echo "tests_passed=true" >> $GITHUB_OUTPUT
+          echo "✅ OK - All integration tests passed"
+
+  # ============================================================
+  # JOB 8 — Destroy Staging EC2
+  # Always runs — whether tests pass or fail
+  # No orphaned instances left running
+  # ============================================================
+  destroy-staging:
+    name: Destroy Staging EC2
+    runs-on: ubuntu-24.04
+    needs: [spin-up-staging, integration-tests]
+    if: always()
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Terminate staging EC2
+        run: |
+          INSTANCE_ID="${{ needs.spin-up-staging.outputs.instance_id }}"
+          echo "Terminating staging EC2: ${INSTANCE_ID}"
+          aws ec2 terminate-instances --instance-ids ${INSTANCE_ID}
+          aws ec2 wait instance-terminated --instance-ids ${INSTANCE_ID}
+          echo "✅ OK - Staging EC2 terminated"
+          echo "No orphaned instances running"
+
+  # ============================================================
+  # JOB 9 — Push Images to ECR
+  # Only runs if integration tests passed
+  # Pushes versioned tag + latest
   # ============================================================
   push-images:
     name: Push Images to ECR
     runs-on: ubuntu-24.04
-    needs: build-images
+    needs: [build-images, destroy-staging, integration-tests]
+    if: |
+      needs.integration-tests.result == 'success' &&
+      needs.integration-tests.outputs.tests_passed == 'true'
     outputs:
       image_tag: ${{ needs.build-images.outputs.image_tag }}
     steps:
@@ -207,16 +495,13 @@ jobs:
           aws-region:            ${{ secrets.AWS_REGION }}
 
       - name: Login to ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Push frontend image
-        run: |
-          echo "Pushing frontend image to ECR..."
-          echo "Tag: ${{ needs.build-images.outputs.image_tag }}"
+        run: echo "Pushing frontend image — tag ${{ needs.build-images.outputs.image_tag }}"
 
       - uses: docker/build-push-action@v5
         with:
@@ -231,9 +516,7 @@ jobs:
             ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:latest
 
       - name: Push backend image
-        run: |
-          echo "Pushing backend image to ECR..."
-          echo "Tag: ${{ needs.build-images.outputs.image_tag }}"
+        run: echo "Pushing backend image — tag ${{ needs.build-images.outputs.image_tag }}"
 
       - uses: docker/build-push-action@v5
         with:
@@ -251,3 +534,4 @@ jobs:
           echo "Frontend: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend:${{ needs.build-images.outputs.image_tag }}"
           echo "Backend:  ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend:${{ needs.build-images.outputs.image_tag }}"
           echo "Both images also tagged as ':latest'"
+ENDOFFILE
