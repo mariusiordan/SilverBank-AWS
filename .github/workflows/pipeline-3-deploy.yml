@@ -109,13 +109,18 @@ jobs:
     runs-on: ubuntu-24.04
     needs: approve
     outputs:
-      active_env: ${{ steps.detect.outputs.active_env }}
-      idle_env:   ${{ steps.detect.outputs.idle_env }}
-      active_tg_arn: ${{ steps.detect.outputs.active_tg_arn }}
-      idle_tg_arn:   ${{ steps.detect.outputs.idle_tg_arn }}
-      idle_asg_name: ${{ steps.detect.outputs.idle_asg_name }}
+      active_env:      ${{ steps.detect.outputs.active_env }}
+      idle_env:        ${{ steps.detect.outputs.idle_env }}
+      active_tg_arn:   ${{ steps.detect.outputs.active_tg_arn }}
+      idle_tg_arn:     ${{ steps.detect.outputs.idle_tg_arn }}
+      idle_asg_name:   ${{ steps.detect.outputs.idle_asg_name }}
       active_asg_name: ${{ steps.detect.outputs.active_asg_name }}
+      alb_listener_arn: ${{ steps.tf-outputs.outputs.alb_listener_arn }}
+      blue_tg_arn:     ${{ steps.tf-outputs.outputs.blue_tg_arn }}
+      green_tg_arn:    ${{ steps.tf-outputs.outputs.green_tg_arn }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -123,45 +128,33 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      - name: Detect active environment
-        id: detect
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Read Terraform outputs from S3 state
+        id: tf-outputs
+        working-directory: aws-silverbank-ec2/terraform
         run: |
-          echo "Querying ALB listener to detect active environment..."
+          echo "Reading infrastructure values from Terraform state..."
+          terraform init -reconfigure
 
-          # Get the current target group ARN from the ALB listener
-          CURRENT_TG_ARN=$(aws elbv2 describe-listeners \
-            --listener-arns ${{ secrets.ALB_LISTENER_ARN }} \
-            --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
-            --output text)
+          ALB_LISTENER_ARN=$(terraform output -raw alb_listener_arn)
+          BLUE_TG_ARN=$(terraform output -raw blue_target_group_arn)
+          GREEN_TG_ARN=$(terraform output -raw green_target_group_arn)
+          ALB_DNS=$(terraform output -raw alb_dns_name)
+          STAGING_SUBNET=$(terraform output -raw staging_subnet_id)
+          STAGING_SG=$(terraform output -raw staging_sg_id)
 
-          echo "Current target group ARN: ${CURRENT_TG_ARN}"
+          echo "alb_listener_arn=${ALB_LISTENER_ARN}" >> $GITHUB_OUTPUT
+          echo "blue_tg_arn=${BLUE_TG_ARN}"           >> $GITHUB_OUTPUT
+          echo "green_tg_arn=${GREEN_TG_ARN}"         >> $GITHUB_OUTPUT
+          echo "alb_dns=${ALB_DNS}"                   >> $GITHUB_OUTPUT
+          echo "staging_subnet=${STAGING_SUBNET}"     >> $GITHUB_OUTPUT
+          echo "staging_sg=${STAGING_SG}"             >> $GITHUB_OUTPUT
 
-          # Determine active/idle based on target group name
-          if echo "${CURRENT_TG_ARN}" | grep -q "blue"; then
-            ACTIVE_ENV="blue"
-            IDLE_ENV="green"
-            ACTIVE_TG_ARN="${CURRENT_TG_ARN}"
-            IDLE_TG_ARN="${{ secrets.GREEN_TG_ARN }}"
-            IDLE_ASG="${{ secrets.GREEN_ASG_NAME }}"
-            ACTIVE_ASG="${{ secrets.BLUE_ASG_NAME }}"
-          else
-            ACTIVE_ENV="green"
-            IDLE_ENV="blue"
-            ACTIVE_TG_ARN="${CURRENT_TG_ARN}"
-            IDLE_TG_ARN="${{ secrets.BLUE_TG_ARN }}"
-            IDLE_ASG="${{ secrets.BLUE_ASG_NAME }}"
-            ACTIVE_ASG="${{ secrets.GREEN_ASG_NAME }}"
-          fi
-
-          echo "active_env=${ACTIVE_ENV}"         >> $GITHUB_OUTPUT
-          echo "idle_env=${IDLE_ENV}"             >> $GITHUB_OUTPUT
-          echo "active_tg_arn=${ACTIVE_TG_ARN}"   >> $GITHUB_OUTPUT
-          echo "idle_tg_arn=${IDLE_TG_ARN}"       >> $GITHUB_OUTPUT
-          echo "idle_asg_name=${IDLE_ASG}"        >> $GITHUB_OUTPUT
-          echo "active_asg_name=${ACTIVE_ASG}"    >> $GITHUB_OUTPUT
-
-          echo "✅ OK - Active environment: ${ACTIVE_ENV}"
-          echo "✅ OK - Idle environment (deploy target): ${IDLE_ENV}"
+          echo "✅ OK - Terraform outputs retrieved from S3 state"
 
   # ============================================================
   # JOB 4 — Deploy to Idle Environment
