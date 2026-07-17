@@ -1,0 +1,119 @@
+name: Pipeline 3 - Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        default: 'latest'
+
+jobs:
+  deploy:
+    name: Blue/Green Deploy via SSM
+    runs-on: ubuntu-latest
+    env:
+      OBJC_DISABLE_INITIALIZE_FORK_SAFETY: YES
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    steps:
+      - name: Checkout app repo
+        uses: actions/checkout@v4
+
+      - name: Checkout infra repo (public)
+        uses: actions/checkout@v4
+        with:
+          repository: mariusiordan/DevOps-final-project
+          path: infra
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install Ansible + SSM deps
+        run: |
+          pip install ansible boto3
+          ansible-galaxy collection install community.aws
+          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o smp.deb
+          sudo dpkg -i smp.deb
+          echo "deps installed"
+
+      - name: Write vault password
+        run: |
+          echo "${{ secrets.VAULT_PASSWORD }}" > /tmp/vault-pass
+          chmod 600 /tmp/vault-pass
+
+      - name: Generate SSM inventory
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          get_id() {
+            aws ec2 describe-instances --region eu-west-2 \
+              --filters "Name=tag:Name,Values=$1" "Name=instance-state-name,Values=running" \
+              --query 'Reservations[0].Instances[0].InstanceId' --output text
+          }
+          EDGE=$(get_id edge-nginx)
+          BLUE=$(get_id prod-vm1-BLUE)
+          GREEN=$(get_id prod-vm2-GREEN)
+          DB=$(get_id db-postgresql)
+          echo "EDGE=$EDGE BLUE=$BLUE GREEN=$GREEN DB=$DB"
+          cat > inventory-ssm.ini << INV
+          [edge]
+          edge-nginx ansible_aws_ssm_instance_id=$EDGE
+          [prod]
+          prod-vm1-BLUE ansible_aws_ssm_instance_id=$BLUE
+          prod-vm2-GREEN ansible_aws_ssm_instance_id=$GREEN
+          [db]
+          db-postgresql ansible_aws_ssm_instance_id=$DB
+          [all:vars]
+          ansible_connection=community.aws.aws_ssm
+          ansible_aws_ssm_region=eu-west-2
+          ansible_aws_ssm_bucket_name=silverbank-tfstate-mariusiordan
+          ansible_aws_ssm_bucket_prefix=ssm-transfer
+          ansible_python_interpreter=/usr/bin/python3
+          ansible_remote_tmp=/tmp/.ansible-tmp
+          ansible_aws_ssm_document_name=AWS-StartNonInteractiveCommand
+          ansible_become=true
+          INV
+          echo "inventory generated"
+
+      - name: Detect idle environment
+        id: detect
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          ACTIVE=$(ansible edge -i inventory-ssm.ini -m shell \
+            -a "grep -E '^\s*server.*:3000' /etc/nginx/conf.d/upstream.conf | grep -ioE 'blue|green' | head -1" \
+            | grep -ioE 'blue|green' | head -1)
+          echo "Active: $ACTIVE"
+          if [ "$ACTIVE" = "BLUE" ] || [ "$ACTIVE" = "blue" ]; then IDLE=green; else IDLE=blue; fi
+          echo "Idle: $IDLE"
+          echo "idle=$IDLE" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to idle
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          IDLE="${{ steps.detect.outputs.idle }}"
+          if [ "$IDLE" = "green" ]; then LIMIT="prod-vm2-GREEN"; else LIMIT="prod-vm1-BLUE"; fi
+          echo "Deploying to $IDLE ($LIMIT)..."
+          ansible-playbook playbooks/deploy-production.yml \
+            -i inventory-ssm.ini --limit "$LIMIT" \
+            --vault-password-file /tmp/vault-pass \
+            -e "app_tag=${{ github.event.inputs.image_tag }}"
+
+      - name: Switch traffic
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          IDLE="${{ steps.detect.outputs.idle }}"
+          ansible edge -i inventory-ssm.ini -m shell -a "/opt/switch-backend.sh $IDLE"
+          echo "traffic now on $IDLE"
+
+      - name: Verify
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          sleep 5
+          ansible edge -i inventory-ssm.ini -m shell -a "curl -sf http://localhost/api/health || echo HEALTH_FAILED"
+
+      - name: Cleanup vault password
+        if: always()
+        run: rm -f /tmp/vault-pass
