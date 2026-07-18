@@ -127,7 +127,7 @@ jobs:
           [all:vars]
           ansible_connection=community.aws.aws_ssm
           ansible_aws_ssm_region=eu-west-2
-          ansible_aws_ssm_bucket_name=silverbank-tfstate-mariusiordan
+          ansible_aws_ssm_bucket_name=silverbank-ssm-transfer-mariusiordan
           ansible_aws_ssm_bucket_prefix=ssm-transfer
           ansible_python_interpreter=/usr/bin/python3
           ansible_remote_tmp=/tmp/.ansible-tmp
@@ -225,7 +225,7 @@ jobs:
           [all:vars]
           ansible_connection=community.aws.aws_ssm
           ansible_aws_ssm_region=eu-west-2
-          ansible_aws_ssm_bucket_name=silverbank-tfstate-mariusiordan
+          ansible_aws_ssm_bucket_name=silverbank-ssm-transfer-mariusiordan
           ansible_aws_ssm_bucket_prefix=ssm-transfer
           ansible_python_interpreter=/usr/bin/python3
           ansible_remote_tmp=/tmp/.ansible-tmp
@@ -332,7 +332,7 @@ jobs:
           [all:vars]
           ansible_connection=community.aws.aws_ssm
           ansible_aws_ssm_region=eu-west-2
-          ansible_aws_ssm_bucket_name=silverbank-tfstate-mariusiordan
+          ansible_aws_ssm_bucket_name=silverbank-ssm-transfer-mariusiordan
           ansible_aws_ssm_bucket_prefix=ssm-transfer
           ansible_python_interpreter=/usr/bin/python3
           ansible_remote_tmp=/tmp/.ansible-tmp
