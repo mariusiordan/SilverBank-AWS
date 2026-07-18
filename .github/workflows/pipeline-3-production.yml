@@ -153,6 +153,13 @@ jobs:
           echo "idle=$IDLE" >> "$GITHUB_OUTPUT"
           echo "✅ Serving traffic: ${ACTIVE^^} | Deploy target: ${IDLE^^}"
 
+      - name: Back up production database to S3
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          echo "Creating a database backup before touching production..."
+          ansible db -i inventory-ssm.ini -m shell -a "/opt/backup-db.sh"
+          echo "✅ Database backed up to S3 - restore point available if this release fails"
+
       - name: Deploy application to idle host
         working-directory: infra/aws-silverbank/ansible
         run: |
