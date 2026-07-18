@@ -1,0 +1,656 @@
+# .github/workflows/pipeline-3-deploy.yml
+#
+# Pipeline 3 — Blue/Green Production Deployment
+# Trigger: manual (workflow_dispatch)
+#
+# Flow:
+#   approve (manual gate)
+#     ├── backup-database
+#     ├── read-infra
+#     └── detect-environment (needs read-infra)
+#           └── deploy-to-idle
+#                 └── smoke-tests
+#                       └── switch-traffic
+#                             └── monitor (10 min)
+#                                   ├── stable → scale-up → tag-stable
+#                                   └── unstable → rollback
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag to deploy (e.g. v1.0-sha-abc1234)'
+        required: true
+        type: string
+      reason:
+        description: 'Reason for deployment'
+        required: true
+        type: string
+
+jobs:
+  # ============================================================
+  # JOB 1 — Manual Approval Gate
+  # Requires a release manager to approve before production deploy
+  # Last checkpoint before touching production
+  # ============================================================
+  approve:
+    name: Manual Approval
+    runs-on: ubuntu-24.04
+    environment: production
+    steps:
+      - name: Approval granted
+        run: |
+          echo "✅ OK - Manual approval granted"
+          echo "Deploying image tag: ${{ github.event.inputs.image_tag }}"
+          echo "Reason: ${{ github.event.inputs.reason }}"
+          echo "Triggered by: ${{ github.actor }}"
+
+  # ============================================================
+  # JOB 2 — Read Infrastructure Values from Terraform State
+  # Reads all dynamic AWS values fresh from S3 state
+  # Values are always correct even after destroy + re-apply
+  # ============================================================
+  read-infra:
+    name: Read Infrastructure Values
+    runs-on: ubuntu-24.04
+    needs: approve
+    outputs:
+      alb_listener_arn: ${{ steps.tf.outputs.alb_listener_arn }}
+      blue_tg_arn:      ${{ steps.tf.outputs.blue_tg_arn }}
+      green_tg_arn:     ${{ steps.tf.outputs.green_tg_arn }}
+      alb_dns_name:     ${{ steps.tf.outputs.alb_dns_name }}
+      blue_asg_name:    ${{ steps.tf.outputs.blue_asg_name }}
+      green_asg_name:   ${{ steps.tf.outputs.green_asg_name }}
+      rds_endpoint:     ${{ steps.tf.outputs.rds_endpoint }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: mariusiordan/DevOps-final-project
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Read Terraform outputs from S3 state
+        id: tf
+        working-directory: aws-silverbank-ec2/terraform
+        run: |
+          echo "Reading infrastructure values from Terraform state in S3..."
+          terraform init -reconfigure
+
+          ALB_LISTENER=$(terraform output -raw alb_listener_arn)
+          BLUE_TG=$(terraform output -raw blue_target_group_arn)
+          GREEN_TG=$(terraform output -raw green_target_group_arn)
+          ALB_DNS=$(terraform output -raw alb_dns_name)
+          BLUE_ASG=$(terraform output -raw blue_asg_name)
+          GREEN_ASG=$(terraform output -raw green_asg_name)
+          RDS_ENDPOINT=$(terraform output -raw rds_endpoint)
+
+          echo "alb_listener_arn=${ALB_LISTENER}" >> $GITHUB_OUTPUT
+          echo "blue_tg_arn=${BLUE_TG}"           >> $GITHUB_OUTPUT
+          echo "green_tg_arn=${GREEN_TG}"         >> $GITHUB_OUTPUT
+          echo "alb_dns_name=${ALB_DNS}"          >> $GITHUB_OUTPUT
+          echo "blue_asg_name=${BLUE_ASG}"        >> $GITHUB_OUTPUT
+          echo "green_asg_name=${GREEN_ASG}"      >> $GITHUB_OUTPUT
+          echo "rds_endpoint=${RDS_ENDPOINT}"     >> $GITHUB_OUTPUT
+
+          echo "✅ OK - Infrastructure values retrieved from S3 state"
+
+  # ============================================================
+  # JOB 3 — Backup Database to S3
+  # pg_dump RDS before touching production
+  # Backup linked to image tag for traceability
+  # Stored in existing S3 bucket with 30-day lifecycle rule
+  # Runs in parallel with read-infra and detect-environment
+  # ============================================================
+  backup-database:
+    name: Backup Database to S3
+    runs-on: ubuntu-24.04
+    needs: [approve, read-infra]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Install PostgreSQL client
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y postgresql-client
+          echo "✅ OK - PostgreSQL client installed"
+
+      - name: Backup RDS to S3
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          TAG="${{ github.event.inputs.image_tag }}"
+          BACKUP_FILE="backup_${TIMESTAMP}_${TAG}.sql"
+
+          echo "Creating RDS backup before deployment..."
+          echo "Tag: ${TAG}"
+          echo "File: ${BACKUP_FILE}"
+
+          PGPASSWORD=${{ secrets.DB_PASSWORD }} pg_dump \
+            -h ${{ needs.read-infra.outputs.rds_endpoint }} \
+            -U ${{ secrets.DB_USERNAME }} \
+            -d ${{ secrets.DB_NAME }} \
+            -f /tmp/${BACKUP_FILE}
+          echo "✅ OK - pg_dump complete"
+
+          aws s3 cp /tmp/${BACKUP_FILE} \
+            s3://silverbank-tfstate-mariusiordan/db-backups/${BACKUP_FILE}
+          echo "✅ OK - Backup uploaded to S3"
+          echo "Location: s3://silverbank-tfstate-mariusiordan/db-backups/${BACKUP_FILE}"
+
+          rm /tmp/${BACKUP_FILE}
+          echo "✅ OK - Local cleanup complete"
+
+  # ============================================================
+  # JOB 4 — Detect Active Environment
+  # Queries ALB listener using ARN from read-infra
+  # Determines which color is active and which is idle
+  # ============================================================
+  detect-environment:
+    name: Detect Active Environment
+    runs-on: ubuntu-24.04
+    needs: [backup-database, read-infra]
+    outputs:
+      active_env:      ${{ steps.detect.outputs.active_env }}
+      idle_env:        ${{ steps.detect.outputs.idle_env }}
+      active_tg_arn:   ${{ steps.detect.outputs.active_tg_arn }}
+      idle_tg_arn:     ${{ steps.detect.outputs.idle_tg_arn }}
+      idle_asg_name:   ${{ steps.detect.outputs.idle_asg_name }}
+      active_asg_name: ${{ steps.detect.outputs.active_asg_name }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Detect active environment
+        id: detect
+        run: |
+          echo "Querying ALB listener to detect active environment..."
+
+          CURRENT_TG_ARN=$(aws elbv2 describe-listeners \
+            --listener-arns ${{ needs.read-infra.outputs.alb_listener_arn }} \
+            --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+            --output text)
+
+          echo "Current target group ARN: ${CURRENT_TG_ARN}"
+
+          BLUE_TG="${{ needs.read-infra.outputs.blue_tg_arn }}"
+          GREEN_TG="${{ needs.read-infra.outputs.green_tg_arn }}"
+          BLUE_ASG="${{ needs.read-infra.outputs.blue_asg_name }}"
+          GREEN_ASG="${{ needs.read-infra.outputs.green_asg_name }}"
+
+          if [ "${CURRENT_TG_ARN}" = "${BLUE_TG}" ]; then
+            ACTIVE_ENV="blue"
+            IDLE_ENV="green"
+            ACTIVE_TG_ARN="${BLUE_TG}"
+            IDLE_TG_ARN="${GREEN_TG}"
+            IDLE_ASG="${GREEN_ASG}"
+            ACTIVE_ASG="${BLUE_ASG}"
+          else
+            ACTIVE_ENV="green"
+            IDLE_ENV="blue"
+            ACTIVE_TG_ARN="${GREEN_TG}"
+            IDLE_TG_ARN="${BLUE_TG}"
+            IDLE_ASG="${BLUE_ASG}"
+            ACTIVE_ASG="${GREEN_ASG}"
+          fi
+
+          echo "active_env=${ACTIVE_ENV}"       >> $GITHUB_OUTPUT
+          echo "idle_env=${IDLE_ENV}"           >> $GITHUB_OUTPUT
+          echo "active_tg_arn=${ACTIVE_TG_ARN}" >> $GITHUB_OUTPUT
+          echo "idle_tg_arn=${IDLE_TG_ARN}"     >> $GITHUB_OUTPUT
+          echo "idle_asg_name=${IDLE_ASG}"      >> $GITHUB_OUTPUT
+          echo "active_asg_name=${ACTIVE_ASG}"  >> $GITHUB_OUTPUT
+
+          echo "✅ OK - Active environment: ${ACTIVE_ENV}"
+          echo "✅ OK - Idle environment (deploy target): ${IDLE_ENV}"
+
+  # ============================================================
+  # JOB 5 — Deploy to Idle Environment
+  # Updates the idle ASG launch template with the new image tag
+  # Triggers instance refresh — zero user impact
+  # Traffic still flows to active environment during this step
+  # ============================================================
+  deploy-to-idle:
+    name: Deploy to Idle Environment
+    runs-on: ubuntu-24.04
+    needs: [detect-environment]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Update launch template with new image tag
+        run: |
+          IDLE_ENV="${{ needs.detect-environment.outputs.idle_env }}"
+          TAG="${{ github.event.inputs.image_tag }}"
+
+          echo "Updating launch template for ${IDLE_ENV} environment..."
+          echo "New image tag: ${TAG}"
+
+          LT_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names ${{ needs.detect-environment.outputs.idle_asg_name }} \
+            --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' \
+            --output text)
+
+          echo "Launch template ID: ${LT_ID}"
+
+          aws ec2 create-launch-template-version \
+            --launch-template-id ${LT_ID} \
+            --source-version '$Latest' \
+            --launch-template-data "{
+              \"UserData\": \"$(aws ec2 describe-launch-template-versions \
+                --launch-template-id ${LT_ID} \
+                --versions '$Latest' \
+                --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+                --output text | base64 -d | \
+                sed 's|:latest|:${TAG}|g' | \
+                base64 -w 0)\"
+            }"
+
+          echo "✅ OK - Launch template updated with tag: ${TAG}"
+
+      - name: Trigger instance refresh on idle ASG
+        run: |
+          IDLE_ASG="${{ needs.detect-environment.outputs.idle_asg_name }}"
+          echo "Triggering instance refresh on ${IDLE_ASG}..."
+
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name ${IDLE_ASG} \
+            --preferences '{"MinHealthyPercentage": 0, "InstanceWarmup": 120}' \
+            --query 'InstanceRefreshId' \
+            --output text
+
+          echo "✅ OK - Instance refresh started"
+
+      - name: Wait for instance refresh to complete
+        run: |
+          IDLE_ASG="${{ needs.detect-environment.outputs.idle_asg_name }}"
+          echo "Waiting for instance refresh to complete..."
+
+          for i in $(seq 1 20); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name ${IDLE_ASG} \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text)
+
+            echo "Attempt ${i}/20 — Status: ${STATUS}"
+
+            if [ "${STATUS}" = "Successful" ]; then
+              echo "✅ OK - Instance refresh complete"
+              exit 0
+            elif [ "${STATUS}" = "Failed" ] || [ "${STATUS}" = "Cancelled" ]; then
+              echo "❌ Instance refresh ${STATUS}"
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+          echo "❌ Instance refresh timed out"
+          exit 1
+
+  # ============================================================
+  # JOB 6 — Smoke Tests
+  # Verifies the new version is healthy on the idle target group
+  # Tests directly on the instance — bypasses ALB listener
+  # If smoke tests fail — deployment stops, no traffic switch
+  # ============================================================
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-24.04
+    needs: [detect-environment, deploy-to-idle]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Wait for health checks on idle target group
+        run: |
+          IDLE_TG_ARN="${{ needs.detect-environment.outputs.idle_tg_arn }}"
+          IDLE_ENV="${{ needs.detect-environment.outputs.idle_env }}"
+
+          echo "Waiting for ${IDLE_ENV} target group to be healthy..."
+
+          for i in $(seq 1 20); do
+            HEALTHY=$(aws elbv2 describe-target-health \
+              --target-group-arn ${IDLE_TG_ARN} \
+              --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`] | length(@)' \
+              --output text)
+
+            echo "Attempt ${i}/20 — Healthy instances: ${HEALTHY}"
+
+            if [ "${HEALTHY}" -ge "1" ]; then
+              echo "✅ OK - At least 1 healthy instance in ${IDLE_ENV} target group"
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          echo "❌ No healthy instances after 5 minutes"
+          exit 1
+
+      - name: Verify health endpoint on idle instance
+        run: |
+          IDLE_TG_ARN="${{ needs.detect-environment.outputs.idle_tg_arn }}"
+          TAG="${{ github.event.inputs.image_tag }}"
+
+          INSTANCE_ID=$(aws elbv2 describe-target-health \
+            --target-group-arn ${IDLE_TG_ARN} \
+            --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`][0].Target.Id' \
+            --output text)
+
+          INSTANCE_IP=$(aws ec2 describe-instances \
+            --instance-ids ${INSTANCE_ID} \
+            --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+            --output text)
+
+          echo "Testing health endpoint on instance: ${INSTANCE_IP}"
+
+          RESPONSE=$(curl -sf http://${INSTANCE_IP}:4000/api/health)
+          echo "Health response: ${RESPONSE}"
+
+          if echo "${RESPONSE}" | grep -q "${TAG}"; then
+            echo "✅ OK - Correct image tag confirmed: ${TAG}"
+          else
+            echo "⚠️  Warning: image_tag not found in health response"
+          fi
+
+          echo "✅ OK - Smoke tests passed"
+
+  # ============================================================
+  # JOB 7 — Switch Traffic
+  # Updates ALB listener to forward to idle target group
+  # Instant, zero downtime — equivalent to Nginx reload on Proxmox
+  # ============================================================
+  switch-traffic:
+    name: Switch Traffic
+    runs-on: ubuntu-24.04
+    needs: [read-infra, detect-environment, smoke-tests]
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Switch ALB listener to idle environment
+        run: |
+          IDLE_ENV="${{ needs.detect-environment.outputs.idle_env }}"
+          IDLE_TG_ARN="${{ needs.detect-environment.outputs.idle_tg_arn }}"
+          ALB_LISTENER_ARN="${{ needs.read-infra.outputs.alb_listener_arn }}"
+
+          echo "Switching ALB traffic to: ${IDLE_ENV}"
+
+          aws elbv2 modify-listener \
+            --listener-arn ${ALB_LISTENER_ARN} \
+            --default-actions Type=forward,TargetGroupArn=${IDLE_TG_ARN}
+
+          echo "✅ OK - Traffic switched to ${IDLE_ENV}"
+          echo "100% of traffic now flows to: ${IDLE_ENV}"
+
+      - name: Verify switch
+        run: |
+          sleep 5
+          ALB_LISTENER_ARN="${{ needs.read-infra.outputs.alb_listener_arn }}"
+
+          CURRENT_TG=$(aws elbv2 describe-listeners \
+            --listener-arns ${ALB_LISTENER_ARN} \
+            --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
+            --output text)
+
+          IDLE_TG="${{ needs.detect-environment.outputs.idle_tg_arn }}"
+
+          if [ "${CURRENT_TG}" = "${IDLE_TG}" ]; then
+            echo "✅ OK - ALB listener confirmed pointing to new environment"
+          else
+            echo "❌ ALB listener switch failed"
+            exit 1
+          fi
+
+  # ============================================================
+  # JOB 8 — Monitor (10 minutes)
+  # Polls CloudWatch alarms and ALB health every 60 seconds
+  # Output: stable=true/false for conditional next steps
+  # ============================================================
+  monitor:
+    name: Monitor (10 min)
+    runs-on: ubuntu-24.04
+    needs: [detect-environment, switch-traffic]
+    outputs:
+      stable: ${{ steps.run-monitor.outputs.stable }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Monitor for 10 minutes
+        id: run-monitor
+        run: |
+          IDLE_ENV="${{ needs.detect-environment.outputs.idle_env }}"
+          IDLE_TG_ARN="${{ needs.detect-environment.outputs.idle_tg_arn }}"
+          PROJECT="silverbank"
+          ENVIRONMENT="production"
+
+          echo "Starting 10-minute monitoring window..."
+          echo "Monitoring environment: ${IDLE_ENV}"
+          echo "Checking every 60 seconds — 10 checks total"
+
+          for i in $(seq 1 10); do
+            echo "--- Check ${i}/10 ---"
+
+            UNHEALTHY=$(aws elbv2 describe-target-health \
+              --target-group-arn ${IDLE_TG_ARN} \
+              --query 'TargetHealthDescriptions[?TargetHealth.State!=`healthy`] | length(@)' \
+              --output text)
+
+            if [ "${UNHEALTHY}" -gt "0" ]; then
+              echo "❌ ${UNHEALTHY} unhealthy host(s) detected"
+              echo "stable=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            ALARM_STATE=$(aws cloudwatch describe-alarms \
+              --alarm-names "${PROJECT}-${IDLE_ENV}-unhealthy-hosts-${ENVIRONMENT}" \
+              --query 'MetricAlarms[0].StateValue' \
+              --output text)
+
+            if [ "${ALARM_STATE}" = "ALARM" ]; then
+              echo "❌ CloudWatch alarm: ${IDLE_ENV} unhealthy hosts"
+              echo "stable=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            ALB_ALARM=$(aws cloudwatch describe-alarms \
+              --alarm-names "${PROJECT}-alb-5xx-${ENVIRONMENT}" \
+              --query 'MetricAlarms[0].StateValue' \
+              --output text)
+
+            if [ "${ALB_ALARM}" = "ALARM" ]; then
+              echo "❌ CloudWatch alarm: ALB 5xx errors"
+              echo "stable=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "✅ Check ${i}/10 passed — all hosts healthy, no alarms"
+            sleep 60
+          done
+
+          echo "✅ OK - 10-minute monitoring window passed"
+          echo "stable=true" >> $GITHUB_OUTPUT
+
+  # ============================================================
+  # JOB 9 — Scale Up (only if stable)
+  # New active ASG → desired=2
+  # Old active ASG → desired=1 (warm standby)
+  # Completes the cost-optimised Blue/Green cycle
+  # ============================================================
+  scale-up:
+    name: Scale Up Active, Scale Down Standby
+    runs-on: ubuntu-24.04
+    needs: [detect-environment, monitor]
+    if: needs.monitor.outputs.stable == 'true'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Scale new active ASG to desired=2
+        run: |
+          NEW_ACTIVE_ASG="${{ needs.detect-environment.outputs.idle_asg_name }}"
+          echo "Scaling up: ${NEW_ACTIVE_ASG} → desired=2"
+
+          aws autoscaling set-desired-capacity \
+            --auto-scaling-group-name ${NEW_ACTIVE_ASG} \
+            --desired-capacity 2
+
+          echo "✅ OK - ${NEW_ACTIVE_ASG} scaled to desired=2"
+
+      - name: Scale old active ASG to desired=1 (warm standby)
+        run: |
+          OLD_ACTIVE_ASG="${{ needs.detect-environment.outputs.active_asg_name }}"
+          echo "Scaling down: ${OLD_ACTIVE_ASG} → desired=1 (warm standby)"
+
+          aws autoscaling set-desired-capacity \
+            --auto-scaling-group-name ${OLD_ACTIVE_ASG} \
+            --desired-capacity 1
+
+          echo "✅ OK - ${OLD_ACTIVE_ASG} scaled to desired=1"
+          echo "Previous version remains available for instant manual rollback"
+
+  # ============================================================
+  # JOB 10 — Tag Stable Image (only if stable)
+  # Confirms the versioned image as :stable in ECR
+  # Only happens after successful 10-minute monitoring window
+  # ============================================================
+  tag-stable:
+    name: Tag Image as Stable
+    runs-on: ubuntu-24.04
+    needs: [read-infra, monitor, scale-up]
+    if: needs.monitor.outputs.stable == 'true'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Tag frontend image as stable
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          FRONTEND_REPO="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-frontend"
+
+          echo "Tagging frontend as :stable..."
+          docker buildx imagetools create \
+            -t ${FRONTEND_REPO}:stable \
+            ${FRONTEND_REPO}:${TAG}
+          echo "✅ OK - Frontend tagged as :stable"
+
+      - name: Tag backend image as stable
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          BACKEND_REPO="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/silverbank-app-backend"
+
+          echo "Tagging backend as :stable..."
+          docker buildx imagetools create \
+            -t ${BACKEND_REPO}:stable \
+            ${BACKEND_REPO}:${TAG}
+          echo "✅ OK - Backend tagged as :stable"
+
+      - name: Deployment complete
+        run: |
+          echo "=================================="
+          echo "✅ DEPLOYMENT COMPLETE"
+          echo "=================================="
+          echo "Image tag:           ${{ github.event.inputs.image_tag }}"
+          echo "Active environment:  ${{ needs.detect-environment.outputs.idle_env }}"
+          echo "Standby environment: ${{ needs.detect-environment.outputs.active_env }}"
+          echo "Images tagged as:    :stable"
+          echo "Manual rollback:     available at any time"
+
+  # ============================================================
+  # JOB 11 — Rollback (only if unstable)
+  # Switches ALB back to previous environment instantly
+  # Previous environment was at desired=2 the whole time
+  # No rebuild, no redeploy — rollback completes in seconds
+  # ============================================================
+  rollback:
+    name: Rollback to Previous Environment
+    runs-on: ubuntu-24.04
+    needs: [read-infra, detect-environment, monitor]
+    if: needs.monitor.outputs.stable == 'false'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Switch ALB back to previous environment
+        run: |
+          ACTIVE_ENV="${{ needs.detect-environment.outputs.active_env }}"
+          ACTIVE_TG_ARN="${{ needs.detect-environment.outputs.active_tg_arn }}"
+          ALB_LISTENER_ARN="${{ needs.read-infra.outputs.alb_listener_arn }}"
+
+          echo "Rolling back to: ${ACTIVE_ENV}"
+
+          aws elbv2 modify-listener \
+            --listener-arn ${ALB_LISTENER_ARN} \
+            --default-actions Type=forward,TargetGroupArn=${ACTIVE_TG_ARN}
+
+          echo "✅ OK - Traffic switched back to ${ACTIVE_ENV}"
+
+      - name: Verify rollback
+        run: |
+          ALB_DNS="${{ needs.read-infra.outputs.alb_dns_name }}"
+          echo "Verifying rollback..."
+          sleep 10
+          curl -f http://$\{ALB_DNS\}/api/health || exit 1
+          echo "✅ OK - Previous environment healthy after rollback"
+
+      - name: Fail pipeline to signal deployment failure
+        run: |
+          echo "❌ Deployment failed — rolled back to ${{ needs.detect-environment.outputs.active_env }}"
+          echo "❌ Image ${{ github.event.inputs.image_tag }} was NOT tagged as stable"
+          exit 1
