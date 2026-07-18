@@ -1,8 +1,8 @@
-name: Build & Push
+name: Pipeline 2 - Build & Deploy Staging
 
 on:
   push:
-    branches: [main]
+    branches: [staging]
   workflow_dispatch:
 
 jobs:
@@ -12,6 +12,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      image_tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
@@ -20,8 +22,9 @@ jobs:
         run: |
           VERSION="v1.0"
           SHA=$(git rev-parse --short HEAD)
-          echo "tag=${VERSION}-sha-${SHA}" >> "$GITHUB_OUTPUT"
-          echo "Building tag: ${VERSION}-sha-${SHA}"
+          TAG="${VERSION}-sha-${SHA}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "✅ Build tag: ${TAG}"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -41,7 +44,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/silverbank-backend:${{ steps.version.outputs.tag }}
-            ghcr.io/${{ github.repository_owner }}/silverbank-backend:latest
+            ghcr.io/${{ github.repository_owner }}/silverbank-backend:staging
 
       - name: Build & push frontend
         uses: docker/build-push-action@v5
@@ -53,4 +56,93 @@ jobs:
             NEXT_PUBLIC_API_URL=
           tags: |
             ghcr.io/${{ github.repository_owner }}/silverbank-frontend:${{ steps.version.outputs.tag }}
-            ghcr.io/${{ github.repository_owner }}/silverbank-frontend:latest
+            ghcr.io/${{ github.repository_owner }}/silverbank-frontend:staging
+
+      - name: Build summary
+        run: |
+          echo "════════════════════════════════════════════"
+          echo "✅ Images built and pushed to GHCR"
+          echo "   Version tag : ${{ steps.version.outputs.tag }}"
+          echo "   Stream tag  : :staging"
+          echo "════════════════════════════════════════════"
+
+  deploy-staging:
+    name: Deploy to staging VM
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    env:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    steps:
+      - name: Checkout infra repo (public)
+        uses: actions/checkout@v4
+        with:
+          repository: mariusiordan/DevOps-final-project
+          path: infra
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install Ansible + SSM deps
+        run: |
+          pip install ansible boto3 > /dev/null
+          ansible-galaxy collection install community.aws > /dev/null
+          curl -s "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o smp.deb
+          sudo dpkg -i smp.deb > /dev/null
+          echo "✅ Ansible, boto3 and session-manager-plugin installed"
+
+      - name: Write vault password
+        run: |
+          echo "${{ secrets.VAULT_PASSWORD }}" > $HOME/.vault-password
+          chmod 600 $HOME/.vault-password
+          echo "✅ Vault password ready"
+
+      - name: Generate SSM inventory
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          get_id() {
+            aws ec2 describe-instances --region eu-west-2 \
+              --filters "Name=tag:Name,Values=$1" "Name=instance-state-name,Values=running" \
+              --query 'Reservations[0].Instances[0].InstanceId' --output text
+          }
+          EDGE=$(get_id edge-nginx)
+          BLUE=$(get_id prod-vm1-BLUE)
+          GREEN=$(get_id prod-vm2-GREEN)
+          DB=$(get_id db-postgresql)
+          MON=$(get_id monitoring-staging)
+          echo "Instances: EDGE=$EDGE BLUE=$BLUE GREEN=$GREEN DB=$DB MON=$MON"
+          cat > inventory-ssm.ini << INV
+          [edge]
+          edge-nginx ansible_aws_ssm_instance_id=$EDGE
+          [prod]
+          prod-vm1-BLUE ansible_aws_ssm_instance_id=$BLUE
+          prod-vm2-GREEN ansible_aws_ssm_instance_id=$GREEN
+          [db]
+          db-postgresql ansible_aws_ssm_instance_id=$DB
+          [monitoring]
+          monitoring-staging ansible_aws_ssm_instance_id=$MON
+          [all:vars]
+          ansible_connection=community.aws.aws_ssm
+          ansible_aws_ssm_region=eu-west-2
+          ansible_aws_ssm_bucket_name=silverbank-tfstate-mariusiordan
+          ansible_aws_ssm_bucket_prefix=ssm-transfer
+          ansible_python_interpreter=/usr/bin/python3
+          ansible_remote_tmp=/tmp/.ansible-tmp
+          ansible_aws_ssm_document_name=AWS-StartNonInteractiveCommand
+          ansible_become=true
+          INV
+          echo "✅ SSM inventory generated"
+
+      - name: Deploy staging stack
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          echo "Deploying tag ':staging' to monitoring-staging VM..."
+          ansible-playbook playbooks/deploy-staging.yml -i inventory-ssm.ini
+          echo "✅ Staging stack deployed"
+
+      - name: Cleanup vault password
+        if: always()
+        run: rm -f $HOME/.vault-password
