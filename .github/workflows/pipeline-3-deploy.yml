@@ -13,8 +13,9 @@ jobs:
     name: Blue/Green Deploy via SSM
     runs-on: ubuntu-latest
     env:
-      OBJC_DISABLE_INITIALIZE_FORK_SAFETY: YES
       ANSIBLE_HOST_KEY_CHECKING: "False"
+      MONITOR_DURATION: 60
+      MONITOR_INTERVAL: 30
     steps:
       - name: Checkout app repo
         uses: actions/checkout@v4
@@ -34,16 +35,17 @@ jobs:
 
       - name: Install Ansible + SSM deps
         run: |
-          pip install ansible boto3
-          ansible-galaxy collection install community.aws
-          curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o smp.deb
-          sudo dpkg -i smp.deb
-          echo "deps installed"
+          pip install ansible boto3 > /dev/null
+          ansible-galaxy collection install community.aws > /dev/null
+          curl -s "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o smp.deb
+          sudo dpkg -i smp.deb > /dev/null
+          echo "✅ Ansible, boto3 and session-manager-plugin installed"
 
       - name: Write vault password
         run: |
           echo "${{ secrets.VAULT_PASSWORD }}" > $HOME/.vault-password
           chmod 600 $HOME/.vault-password
+          echo "✅ Vault password ready"
 
       - name: Generate SSM inventory
         working-directory: infra/aws-silverbank/ansible
@@ -57,7 +59,7 @@ jobs:
           BLUE=$(get_id prod-vm1-BLUE)
           GREEN=$(get_id prod-vm2-GREEN)
           DB=$(get_id db-postgresql)
-          echo "EDGE=$EDGE BLUE=$BLUE GREEN=$GREEN DB=$DB"
+          echo "Instances: EDGE=$EDGE BLUE=$BLUE GREEN=$GREEN DB=$DB"
           cat > inventory-ssm.ini << INV
           [edge]
           edge-nginx ansible_aws_ssm_instance_id=$EDGE
@@ -76,42 +78,92 @@ jobs:
           ansible_aws_ssm_document_name=AWS-StartNonInteractiveCommand
           ansible_become=true
           INV
-          echo "inventory generated"
+          echo "✅ SSM inventory generated with current instance IDs"
 
-      - name: Detect idle environment
+      - name: Cleanup old Docker resources (free disk space)
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          echo "🧹 Removing stopped containers and dangling images on all VMs..."
+          ansible prod:db -i inventory-ssm.ini -m shell \
+            -a "docker container prune -f; docker image prune -f; echo '--- disk:'; df -h / | tail -1"
+          echo "✅ Cleanup done — disk space freed before pulling new images"
+
+      - name: Detect active and idle environments
         id: detect
         working-directory: infra/aws-silverbank/ansible
         run: |
           ACTIVE=$(ansible edge -i inventory-ssm.ini -m shell \
             -a "grep -E '^\s*server.*:3000' /etc/nginx/conf.d/upstream.conf | grep -ioE 'blue|green' | head -1" \
-            | grep -ioE 'blue|green' | head -1)
-          echo "Active: $ACTIVE"
-          if [ "$ACTIVE" = "BLUE" ] || [ "$ACTIVE" = "blue" ]; then IDLE=green; else IDLE=blue; fi
-          echo "Idle: $IDLE"
+            | grep -ioE 'blue|green' | head -1 | tr '[:upper:]' '[:lower:]')
+          if [ "$ACTIVE" = "blue" ]; then IDLE=green; else IDLE=blue; fi
+          echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
           echo "idle=$IDLE" >> "$GITHUB_OUTPUT"
+          echo "✅ Active: ${ACTIVE^^} | Idle (deploy target): ${IDLE^^}"
 
-      - name: Deploy to idle
+      - name: Deploy to idle environment
         working-directory: infra/aws-silverbank/ansible
         run: |
           IDLE="${{ steps.detect.outputs.idle }}"
           if [ "$IDLE" = "green" ]; then LIMIT="prod-vm2-GREEN"; else LIMIT="prod-vm1-BLUE"; fi
-          echo "Deploying to $IDLE ($LIMIT)..."
+          echo "Deploying image tag '${{ github.event.inputs.image_tag }}' to $LIMIT ..."
           ansible-playbook playbooks/deploy-production.yml \
             -i inventory-ssm.ini --limit "$LIMIT" \
             -e "app_tag=${{ github.event.inputs.image_tag }}"
+          echo "✅ Deploy to ${IDLE^^} completed — containers healthy"
 
-      - name: Switch traffic
+      - name: Switch traffic to new environment
         working-directory: infra/aws-silverbank/ansible
         run: |
           IDLE="${{ steps.detect.outputs.idle }}"
           ansible edge -i inventory-ssm.ini -m shell -a "/opt/switch-backend.sh $IDLE"
-          echo "traffic now on $IDLE"
+          echo "✅ Traffic switched to ${IDLE^^}"
 
-      - name: Verify
+      - name: Post-switch health check
         working-directory: infra/aws-silverbank/ansible
         run: |
           sleep 5
-          ansible edge -i inventory-ssm.ini -m shell -a "curl -sf http://localhost/api/health || echo HEALTH_FAILED"
+          if ansible edge -i inventory-ssm.ini -m shell -a "curl -sf http://localhost/api/health" > /dev/null 2>&1; then
+            echo "✅ Post-switch health check passed"
+          else
+            echo "❌ Post-switch health check FAILED"
+            exit 1
+          fi
+
+      - name: Monitor and auto-rollback
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          IDLE="${{ steps.detect.outputs.idle }}"
+          PREVIOUS="${{ steps.detect.outputs.active }}"
+          ELAPSED=0
+          FAILED=0
+          echo "🔍 Monitoring ${IDLE^^} for ${MONITOR_DURATION}s (check every ${MONITOR_INTERVAL}s)..."
+          while [ $ELAPSED -lt $MONITOR_DURATION ]; do
+            if ansible edge -i inventory-ssm.ini -m shell -a "curl -sf http://localhost/api/health" > /dev/null 2>&1; then
+              echo "  ✅ [${ELAPSED}s/${MONITOR_DURATION}s] Health OK"
+            else
+              echo "  ❌ [${ELAPSED}s/${MONITOR_DURATION}s] Health check FAILED"
+              FAILED=1
+              break
+            fi
+            sleep $MONITOR_INTERVAL
+            ELAPSED=$((ELAPSED + MONITOR_INTERVAL))
+          done
+
+          if [ $FAILED -eq 1 ]; then
+            echo "🔄 ROLLBACK: switching traffic back to ${PREVIOUS^^} ..."
+            ansible edge -i inventory-ssm.ini -m shell -a "/opt/switch-backend.sh $PREVIOUS"
+            echo "⚠️  Rollback completed — traffic restored to ${PREVIOUS^^}"
+            exit 1
+          fi
+
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "✅ Monitoring completed successfully"
+          echo "   Duration : ${MONITOR_DURATION}s with no failures"
+          echo "   Live env : ${IDLE^^}"
+          echo "   Image tag: ${{ github.event.inputs.image_tag }}"
+          echo "   Standby  : ${PREVIOUS^^} (ready for next deploy)"
+          echo "════════════════════════════════════════════"
 
       - name: Cleanup vault password
         if: always()
