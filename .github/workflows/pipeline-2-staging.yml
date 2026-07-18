@@ -199,6 +199,12 @@ jobs:
           sudo dpkg -i smp.deb > /dev/null
           echo "✅ Tooling ready"
 
+      - name: Provide Ansible Vault password
+        run: |
+          echo "${{ secrets.VAULT_PASSWORD }}" > $HOME/.vault-password
+          chmod 600 $HOME/.vault-password
+          echo "✅ Vault password configured"
+
       - name: Build SSM inventory for the staging VM
         working-directory: infra/aws-silverbank/ansible
         run: |
@@ -238,6 +244,10 @@ jobs:
         working-directory: infra/aws-silverbank/ansible
         run: |
           ansible monitoring -i inventory-test.ini -m shell -a "rm -f /tmp/integration-tests.sh" || true
+
+      - name: Remove vault password
+        if: always()
+        run: rm -f $HOME/.vault-password
 
   # ============================================================
   # JOB 4 - Pipeline result
