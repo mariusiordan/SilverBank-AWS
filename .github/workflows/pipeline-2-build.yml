@@ -146,3 +146,38 @@ jobs:
       - name: Cleanup vault password
         if: always()
         run: rm -f $HOME/.vault-password
+
+  summary:
+    name: Pipeline summary
+    needs: [build-and-push, deploy-staging]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report result
+        run: |
+          BUILD="${{ needs.build-and-push.result }}"
+          DEPLOY="${{ needs.deploy-staging.result }}"
+          TAG="${{ needs.build-and-push.outputs.image_tag }}"
+
+          echo "════════════════════════════════════════════"
+          echo "  PIPELINE 2 - BUILD & DEPLOY STAGING"
+          echo "════════════════════════════════════════════"
+          echo "  Build images   : $BUILD"
+          echo "  Deploy staging : $DEPLOY"
+          echo "  Image tag      : $TAG"
+          echo "════════════════════════════════════════════"
+
+          if [ "$BUILD" = "success" ] && [ "$DEPLOY" = "success" ]; then
+            echo "  ✅ SUCCESS - staging is running the new build"
+            echo "     Next step: run integration tests, then PR staging -> main"
+            echo "════════════════════════════════════════════"
+          else
+            echo "  ❌ FAILED - staging was not updated"
+            if [ "$BUILD" != "success" ]; then
+              echo "     Build failed - check the build job logs"
+            else
+              echo "     Build OK, but deploy failed - check the deploy job logs"
+            fi
+            echo "════════════════════════════════════════════"
+            exit 1
+          fi
