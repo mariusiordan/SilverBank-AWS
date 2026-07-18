@@ -1,0 +1,289 @@
+name: CD - Staging Deployment
+
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  BACKEND_IMAGE: silverbank-backend
+  FRONTEND_IMAGE: silverbank-frontend
+
+jobs:
+  # ============================================================
+  # JOB 1 - Build and publish images
+  # Build and push happen in the same job by design: each job runs
+  # on a fresh runner, so an image built in one job would not exist
+  # in the next without expensive artifact transfer.
+  # ============================================================
+  build-images:
+    name: Build and publish images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate immutable version tag
+        id: version
+        run: |
+          VERSION="v1.0"
+          SHA=$(git rev-parse --short HEAD)
+          TAG="${VERSION}-sha-${SHA}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "✅ Version tag: ${TAG}"
+
+      - name: Authenticate to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and publish backend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.BACKEND_IMAGE }}:${{ steps.version.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.BACKEND_IMAGE }}:staging
+
+      - name: Build and publish frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.FRONTEND_IMAGE }}:${{ steps.version.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.FRONTEND_IMAGE }}:staging
+
+      - name: Publish summary
+        run: |
+          echo "✅ Images published to ${{ env.REGISTRY }}"
+          echo "   Immutable tag : ${{ steps.version.outputs.tag }}"
+          echo "   Stream tag    : staging"
+          echo "   ':latest' is applied only when promoted to production"
+
+  # ============================================================
+  # JOB 2 - Deploy to staging environment
+  # Isolated 3-tier stack on the staging VM, reached over AWS SSM
+  # ============================================================
+  deploy-staging:
+    name: Deploy to staging environment
+    needs: build-images
+    runs-on: ubuntu-latest
+    env:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    steps:
+      - name: Checkout infrastructure repository
+        uses: actions/checkout@v4
+        with:
+          repository: mariusiordan/DevOps-final-project
+          path: infra
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install Ansible and SSM tooling
+        run: |
+          pip install ansible boto3 > /dev/null
+          ansible-galaxy collection install community.aws > /dev/null
+          curl -s "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o smp.deb
+          sudo dpkg -i smp.deb > /dev/null
+          echo "✅ Ansible, boto3 and session-manager-plugin ready"
+
+      - name: Provide Ansible Vault password
+        run: |
+          echo "${{ secrets.VAULT_PASSWORD }}" > $HOME/.vault-password
+          chmod 600 $HOME/.vault-password
+          echo "✅ Vault password configured"
+
+      - name: Build SSM inventory from live instances
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          get_id() {
+            aws ec2 describe-instances --region eu-west-2 \
+              --filters "Name=tag:Name,Values=$1" "Name=instance-state-name,Values=running" \
+              --query 'Reservations[0].Instances[0].InstanceId' --output text
+          }
+          EDGE=$(get_id edge-nginx)
+          BLUE=$(get_id prod-vm1-BLUE)
+          GREEN=$(get_id prod-vm2-GREEN)
+          DB=$(get_id db-postgresql)
+          MON=$(get_id monitoring-staging)
+          echo "Discovered: EDGE=$EDGE BLUE=$BLUE GREEN=$GREEN DB=$DB MON=$MON"
+          cat > inventory-ssm.ini << INV
+          [edge]
+          edge-nginx ansible_aws_ssm_instance_id=$EDGE
+          [prod]
+          prod-vm1-BLUE ansible_aws_ssm_instance_id=$BLUE
+          prod-vm2-GREEN ansible_aws_ssm_instance_id=$GREEN
+          [db]
+          db-postgresql ansible_aws_ssm_instance_id=$DB
+          [monitoring]
+          monitoring-staging ansible_aws_ssm_instance_id=$MON
+          [all:vars]
+          ansible_connection=community.aws.aws_ssm
+          ansible_aws_ssm_region=eu-west-2
+          ansible_aws_ssm_bucket_name=silverbank-tfstate-mariusiordan
+          ansible_aws_ssm_bucket_prefix=ssm-transfer
+          ansible_python_interpreter=/usr/bin/python3
+          ansible_remote_tmp=/tmp/.ansible-tmp
+          ansible_aws_ssm_document_name=AWS-StartNonInteractiveCommand
+          ansible_become=true
+          INV
+          echo "✅ Inventory generated from current instance IDs"
+
+      - name: Deploy isolated 3-tier stack
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          echo "Deploying ':staging' images to the staging VM..."
+          ansible-playbook playbooks/deploy-staging.yml -i inventory-ssm.ini
+          echo "✅ Staging stack running with its own PostgreSQL"
+
+      - name: Remove vault password
+        if: always()
+        run: rm -f $HOME/.vault-password
+
+
+  # ============================================================
+  # JOB 3 - Integration tests
+  # The staging VM sits in a private subnet, so tests cannot be run
+  # from the runner directly. The script is copied over SSM and
+  # executed on the VM itself against localhost.
+  # ============================================================
+  integration-tests:
+    name: Run integration tests
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    env:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+    steps:
+      - name: Checkout app repository
+        uses: actions/checkout@v4
+
+      - name: Checkout infrastructure repository
+        uses: actions/checkout@v4
+        with:
+          repository: mariusiordan/DevOps-final-project
+          path: infra
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install Ansible and SSM tooling
+        run: |
+          pip install ansible boto3 > /dev/null
+          ansible-galaxy collection install community.aws > /dev/null
+          curl -s "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o smp.deb
+          sudo dpkg -i smp.deb > /dev/null
+          echo "✅ Tooling ready"
+
+      - name: Provide Ansible Vault password
+        run: |
+          echo "${{ secrets.VAULT_PASSWORD }}" > $HOME/.vault-password
+          chmod 600 $HOME/.vault-password
+          echo "✅ Vault password configured"
+
+      - name: Build SSM inventory for the staging VM
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          MON=$(aws ec2 describe-instances --region eu-west-2 \
+            --filters "Name=tag:Name,Values=monitoring-staging" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          echo "Staging VM: $MON"
+          cat > inventory-test.ini << INV
+          [monitoring]
+          monitoring-staging ansible_aws_ssm_instance_id=$MON
+          [all:vars]
+          ansible_connection=community.aws.aws_ssm
+          ansible_aws_ssm_region=eu-west-2
+          ansible_aws_ssm_bucket_name=silverbank-tfstate-mariusiordan
+          ansible_aws_ssm_bucket_prefix=ssm-transfer
+          ansible_python_interpreter=/usr/bin/python3
+          ansible_remote_tmp=/tmp/.ansible-tmp
+          ansible_aws_ssm_document_name=AWS-StartNonInteractiveCommand
+          ansible_become=true
+          INV
+          echo "✅ Inventory ready"
+
+      - name: Copy test script to the staging VM
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          ansible monitoring -i inventory-test.ini -m copy \
+            -a "src=$GITHUB_WORKSPACE/scripts/integration-tests.sh dest=/tmp/integration-tests.sh mode=0755"
+          echo "✅ Test script transferred over SSM"
+
+      - name: Execute integration tests on staging
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          ansible monitoring -i inventory-test.ini -m shell -a "/tmp/integration-tests.sh"
+
+      - name: Remove test script
+        if: always()
+        working-directory: infra/aws-silverbank/ansible
+        run: |
+          ansible monitoring -i inventory-test.ini -m shell -a "rm -f /tmp/integration-tests.sh" || true
+
+      - name: Remove vault password
+        if: always()
+        run: rm -f $HOME/.vault-password
+
+  # ============================================================
+  # JOB 4 - Pipeline result
+  # Runs even when previous jobs fail, so the outcome is always clear
+  # ============================================================
+  summary:
+    name: Pipeline result
+    needs: [build-images, deploy-staging, integration-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report outcome
+        run: |
+          BUILD="${{ needs.build-images.result }}"
+          DEPLOY="${{ needs.deploy-staging.result }}"
+          TESTS="${{ needs.integration-tests.result }}"
+          TAG="${{ needs.build-images.outputs.image_tag }}"
+
+          echo "════════════════════════════════════════════"
+          echo "  CD - STAGING DEPLOYMENT"
+          echo "════════════════════════════════════════════"
+          echo "  Build and publish  : $BUILD"
+          echo "  Deploy to staging  : $DEPLOY"
+          echo "  Integration tests  : $TESTS"
+          echo "  Version tag        : $TAG"
+          echo "════════════════════════════════════════════"
+
+          if [ "$BUILD" = "success" ] && [ "$DEPLOY" = "success" ] && [ "$TESTS" = "success" ]; then
+            echo "  ✅ Staging validated and ready for promotion"
+            echo "     Next: open PR staging -> main to deploy to production"
+            echo "════════════════════════════════════════════"
+          else
+            echo "  ❌ Staging validation failed"
+            [ "$BUILD" != "success" ] && echo "     Build failed - check 'Build and publish images'"
+            [ "$DEPLOY" != "success" ] && [ "$BUILD" = "success" ] && echo "     Deploy failed - check 'Deploy to staging environment'"
+            [ "$TESTS" != "success" ] && [ "$DEPLOY" = "success" ] && echo "     Tests failed - the build must not be promoted"
+            echo "════════════════════════════════════════════"
+            exit 1
+          fi
