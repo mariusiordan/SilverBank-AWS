@@ -37,9 +37,11 @@ body {
   --color-secondary-opacity: #ffcd0331;
   --color-tertiary-opacity: #ff58602d;
   /* --gradient-primary: linear-gradient(to top left, #39b385, #9be15d); */
-  --gradient-primary: linear-gradient(135deg, #EA580C, #F97316, #FB923C);
+  /* --gradient-primary: linear-gradient(135deg, #EA580C, #F97316, #FB923C); */
   /* --gradient-primary: linear-gradient(135deg, #1D4ED8, #3B82F6, #60A5FA); */
   /* --gradient-primary: linear-gradient(135deg, #DC2626, #EF4444, #F87171); */
+  --gradient-primary: linear-gradient(135deg, #2ecc71 0%, #55d98d 40%, #a8e063 100%);
+
   --gradient-secondary: linear-gradient(to top left, #ffb003, #ffcb03);
 }
 
